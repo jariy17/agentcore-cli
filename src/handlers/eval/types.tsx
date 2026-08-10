@@ -23,8 +23,12 @@ import type {
 import type {
   GetBatchEvaluationResponse,
   ListBatchEvaluationsResponse,
+  StartBatchEvaluationResponse,
+  SessionMetadataShape,
+  EvaluationResultContent,
 } from "@aws-sdk/client-bedrock-agentcore";
 import type { CoreOptions } from "../../core/types";
+import type { SessionSourceValue, SessionWindow } from "./sessionSource";
 
 // BatchEvaluationResultEntry is one per-session/-trace/-tool evaluation score,
 // parsed from the CloudWatch output log stream a completed batch evaluation
@@ -150,6 +154,43 @@ export type RoleScopeWarning = {
 
 export type CreateDatasetInput = CreateDatasetRequest;
 
+// StartBatchEvaluationInput is the CLI-facing shape for `batch-evaluation
+// evaluate`. Core turns `source` into the API's dataSourceConfig union and
+// `groundTruth` into evaluationMetadata.
+export type StartBatchEvaluationInput = {
+  name: string;
+  description?: string;
+  evaluatorIds: string[];
+  source: SessionSourceValue;
+  // Already-parsed --ground-truth (SessionMetadataShape[]) → evaluationMetadata.
+  groundTruth?: SessionMetadataShape[];
+  kmsKeyArn?: string;
+};
+
+// OnDemandEvaluateInput is the CLI-facing shape for `ondemand evaluate`. Its
+// source is always the agent arm (on-demand gathers spans client-side, so it has
+// no online-eval / raw data-source arm).
+export type OnDemandEvaluateInput = {
+  agent: string;
+  endpoint?: string;
+  evaluatorIds: string[];
+  window?: SessionWindow;
+  sessionIds?: string[];
+};
+
+// OnDemandEvaluateScore is one evaluator's scores over the collected sessions,
+// plus an aggregate. Mirrors the printed on-demand table.
+export type OnDemandEvaluateScore = {
+  evaluatorId: string;
+  aggregateScore: number;
+  results: EvaluationResultContent[];
+};
+
+export type OnDemandEvaluateResult = {
+  sessionsEvaluated: number;
+  scores: OnDemandEvaluateScore[];
+};
+
 // CoreEvalClient is the evaluator, online evaluation, and dataset surface the eval
 // handlers depend on. It is declared here, next to the handlers that consume it,
 // and implemented by src/core/eval.tsx (dependency inversion: handlers own the
@@ -193,6 +234,20 @@ export interface CoreEvalClient {
     maxResults: number | undefined,
     options: CoreOptions,
   ): Promise<ListBatchEvaluationsResponse>;
+  // startBatchEvaluation submits an async, service-side evaluation over sessions
+  // the service gathers from the resolved data source. Returns the durable job id
+  // + RUNNING status; poll with getBatchEvaluation.
+  startBatchEvaluation(
+    input: StartBatchEvaluationInput,
+    options: CoreOptions,
+  ): Promise<StartBatchEvaluationResponse>;
+  // evaluateOnDemand gathers the target sessions' spans client-side (CloudWatch),
+  // runs the evaluators synchronously via the Evaluate API, and returns per-session
+  // scores. No job is created.
+  evaluateOnDemand(
+    input: OnDemandEvaluateInput,
+    options: CoreOptions,
+  ): Promise<OnDemandEvaluateResult>;
 
   createOnlineEvaluationConfig(
     input: CreateOnlineEvalInput,

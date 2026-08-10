@@ -40,8 +40,19 @@ import {
 import {
   GetBatchEvaluationCommand,
   ListBatchEvaluationsCommand,
+  StartBatchEvaluationCommand,
+  EvaluateCommand,
   type ListBatchEvaluationsResponse,
+  type StartBatchEvaluationResponse,
+  type DataSourceConfig as DataPlaneDataSourceConfig,
+  type CloudWatchFilterConfig,
 } from "@aws-sdk/client-bedrock-agentcore";
+import {
+  StartQueryCommand,
+  GetQueryResultsCommand,
+  type ResultField,
+} from "@aws-sdk/client-cloudwatch-logs";
+import type { DocumentType } from "@smithy/types";
 import { Transform } from "node:stream";
 import { FileWriteError, InputValidationError, NetworkingError } from "../errors";
 import type {
@@ -53,8 +64,14 @@ import type {
   CreateOnlineEvalInput,
   GetBatchEvaluationResult,
   LlmAsAJudgeUpdate,
+  OnDemandEvaluateInput,
+  OnDemandEvaluateResult,
+  OnDemandEvaluateScore,
+  StartBatchEvaluationInput,
   UpdateOnlineEvalInput,
 } from "../handlers/eval/types";
+import type { SessionSourceValue, SessionWindow } from "../handlers/eval/sessionSource";
+import { toSessionFilter } from "../handlers/eval/sessionSource";
 import { atomicWriteStream } from "../io";
 import { isTerminalStatus, readEvaluationResults } from "./batchEvaluationResults";
 import type { AwsClients, CoreFetch, CoreOptions } from "./types";
@@ -278,6 +295,114 @@ export class EvalClient implements CoreEvalClient {
     return this.clients
       .data(toClientConfig(options))
       .send(new ListBatchEvaluationsCommand({ nextToken, maxResults }));
+  }
+
+  // startBatchEvaluation submits the async, service-side job. Core translates the
+  // resolved SessionSourceValue into the dataSourceConfig union: the agent arm
+  // resolves the harness/runtime id to a log group (reusing agentDataSource), the
+  // online-eval arm points at a config ARN, and the raw arm passes JSON through.
+  async startBatchEvaluation(
+    input: StartBatchEvaluationInput,
+    options: CoreOptions,
+  ): Promise<StartBatchEvaluationResponse> {
+    const dataSourceConfig = await this.dataSourceConfigForSource(input.source, options);
+    return this.clients.data(toClientConfig(options)).send(
+      new StartBatchEvaluationCommand({
+        batchEvaluationName: input.name,
+        description: input.description,
+        evaluators: input.evaluatorIds.map((evaluatorId) => ({ evaluatorId })),
+        dataSourceConfig,
+        evaluationMetadata: input.groundTruth ? { sessionMetadata: input.groundTruth } : undefined,
+        kmsKeyArn: input.kmsKeyArn,
+      }),
+    );
+  }
+
+  // dataSourceConfigForSource maps a resolved SessionSourceValue to the data-plane
+  // dataSourceConfig union. The agent arm reuses the same runtime resolution +
+  // log-group derivation the control-plane agentDataSource uses, then attaches the
+  // session-id / time-range filters; the raw arm is returned verbatim.
+  private async dataSourceConfigForSource(
+    source: SessionSourceValue,
+    options: CoreOptions,
+  ): Promise<DataPlaneDataSourceConfig> {
+    if (source.origin === "raw") return source.dataSourceConfig;
+
+    const timeRange = toSessionFilter(source.window);
+
+    if (source.origin === "online-eval") {
+      return {
+        onlineEvaluationConfigSource: {
+          onlineEvaluationConfigArn: source.onlineEvaluationConfigId,
+          timeRange,
+        },
+      };
+    }
+
+    const qualifier = source.endpoint ?? DEFAULT_ENDPOINT_QUALIFIER;
+    const { runtimeId, runtimeName } = await resolveAgentToRuntime(
+      source.agent,
+      this.clients,
+      options,
+    );
+    const filterConfig: CloudWatchFilterConfig | undefined =
+      source.sessionIds || timeRange ? { sessionIds: source.sessionIds, timeRange } : undefined;
+    return {
+      cloudWatchLogs: {
+        logGroupNames: [runtimeLogGroup(runtimeId, qualifier)],
+        serviceNames: [runtimeServiceName(runtimeName, qualifier)],
+        filterConfig,
+      },
+    };
+  }
+
+  // evaluateOnDemand runs the synchronous, client-side path: it queries CloudWatch
+  // for the target sessions' OTel spans itself, then calls the Evaluate API once
+  // per (evaluator, session) with the collected spans. Ported from the old CLI's
+  // fetchSessionSpans + runEvaluatorsOverSessions. No job is created.
+  async evaluateOnDemand(
+    input: OnDemandEvaluateInput,
+    options: CoreOptions,
+  ): Promise<OnDemandEvaluateResult> {
+    const qualifier = input.endpoint ?? DEFAULT_ENDPOINT_QUALIFIER;
+    const { runtimeId } = await resolveAgentToRuntime(input.agent, this.clients, options);
+    const logGroup = runtimeLogGroup(runtimeId, qualifier);
+    const logs = this.clients.logs({ region: options.region });
+
+    const sessions = await fetchSessionSpans(logs, {
+      runtimeId,
+      runtimeLogGroup: logGroup,
+      window: input.window,
+      sessionIds: input.sessionIds,
+    });
+    if (sessions.length === 0) {
+      throw new InputValidationError(
+        `No sessions with evaluable spans were found for agent "${input.agent}". ` +
+          `Widen --lookback-days / the time window, or check --session-ids.`,
+        { meta: { agent: input.agent } },
+      );
+    }
+
+    const data = this.clients.data(toClientConfig(options));
+    const scores: OnDemandEvaluateScore[] = [];
+    for (const evaluatorId of input.evaluatorIds) {
+      const results = [];
+      for (const session of sessions) {
+        const response = await data.send(
+          new EvaluateCommand({
+            evaluatorId,
+            evaluationInput: { sessionSpans: session.spans },
+          }),
+        );
+        results.push(...(response.evaluationResults ?? []));
+      }
+      const numeric = results.map((r) => r.value).filter((v): v is number => typeof v === "number");
+      const aggregateScore =
+        numeric.length > 0 ? numeric.reduce((sum, v) => sum + v, 0) / numeric.length : 0;
+      scores.push({ evaluatorId, aggregateScore, results });
+    }
+
+    return { sessionsEvaluated: sessions.length, scores };
   }
 
   async createOnlineEvaluationConfig(
@@ -664,6 +789,179 @@ function endWithNewline(): Transform {
 // by the runtime *id*.
 function runtimeLogGroup(runtimeId: string, endpoint: string): string {
   return `/aws/bedrock-agentcore/runtimes/${runtimeId}-${endpoint}`;
+}
+
+// --- on-demand client-side span collection (ported from the old CLI's
+// operations/eval/shared/span-collector.ts) ---
+
+const SPANS_LOG_GROUP = "aws/spans";
+
+// Instrumentation scopes / log records the Evaluate API understands. A runtime
+// log record with body.input/body.output carries the conversation turn text.
+const SUPPORTED_SCOPES = new Set([
+  "strands.telemetry.tracer",
+  "opentelemetry.instrumentation.langchain",
+  "openinference.instrumentation.langchain",
+]);
+
+type CollectedSession = { sessionId: string; spans: DocumentType[] };
+
+type FetchSpansOptions = {
+  runtimeId: string;
+  runtimeLogGroup: string;
+  window?: SessionWindow;
+  sessionIds?: string[];
+};
+
+// sanitizeQueryValue strips single quotes so an id can't break out of a CloudWatch
+// Insights query string literal.
+function sanitizeQueryValue(value: string): string {
+  return value.replace(/'/g, "");
+}
+
+// runCwQuery runs a CloudWatch Logs Insights query and waits for completion,
+// returning [] if the log group does not exist yet.
+async function runCwQuery(
+  logs: ReturnType<AwsClients["logs"]>,
+  logGroupName: string,
+  queryString: string,
+  startTimeSec: number,
+  endTimeSec: number,
+): Promise<ResultField[][]> {
+  let queryId: string | undefined;
+  try {
+    const started = await logs.send(
+      new StartQueryCommand({
+        logGroupName,
+        startTime: startTimeSec,
+        endTime: endTimeSec,
+        queryString,
+      }),
+    );
+    queryId = started.queryId;
+  } catch (error) {
+    const name = (error as { name?: string })?.name;
+    if (name === "ResourceNotFoundException") return [];
+    throw error;
+  }
+  if (!queryId) return [];
+
+  for (let i = 0; i < 60; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const res = await logs.send(new GetQueryResultsCommand({ queryId }));
+    const status = res.status ?? "Unknown";
+    if (status === "Failed" || status === "Cancelled") {
+      throw new NetworkingError(`CloudWatch query ${status.toLowerCase()}`);
+    }
+    if (status === "Complete") return res.results ?? [];
+  }
+  throw new NetworkingError("CloudWatch query timed out after 60 seconds");
+}
+
+// fetchSessionSpans queries the shared `aws/spans` log group (and the runtime's
+// own log group) for the agent's OTel spans, grouping them by session id. The
+// Evaluate API takes one session's spans per call. Time window and specific
+// session ids narrow the query. Ported from the old CLI's fetchSessionSpans.
+async function fetchSessionSpans(
+  logs: ReturnType<AwsClients["logs"]>,
+  opts: FetchSpansOptions,
+): Promise<CollectedSession[]> {
+  const filter = toSessionFilter(opts.window);
+  const endTimeMs = filter ? +filter.endTime : Date.now();
+  // Default to a 30-day window when the caller gave no time filter, so the query
+  // is bounded rather than scanning all retained logs.
+  const startTimeMs = filter ? +filter.startTime : endTimeMs - 30 * 24 * 60 * 60 * 1000;
+  const startTimeSec = Math.floor(startTimeMs / 1000);
+  const endTimeSec = Math.floor(endTimeMs / 1000);
+
+  let spanQuery =
+    `fields @message, attributes.session.id as sessionId, traceId\n` +
+    `     | parse resource.attributes.cloud.resource_id "runtime/*/" as parsedAgentId\n` +
+    `     | filter parsedAgentId = '${sanitizeQueryValue(opts.runtimeId)}'\n` +
+    `     | filter ispresent(scope.name) and ispresent(kind)`;
+  if (opts.sessionIds && opts.sessionIds.length > 0) {
+    const ids = opts.sessionIds.map((s) => `'${sanitizeQueryValue(s)}'`).join(", ");
+    spanQuery += `\n     | filter attributes.session.id in [${ids}]`;
+  }
+  spanQuery += `\n     | sort startTimeUnixNano asc\n     | limit 10000`;
+
+  const [sharedRows, runtimeRows] = await Promise.all([
+    runCwQuery(logs, SPANS_LOG_GROUP, spanQuery, startTimeSec, endTimeSec),
+    runCwQuery(logs, opts.runtimeLogGroup, spanQuery, startTimeSec, endTimeSec),
+  ]);
+  const allSpanRows = [...sharedRows, ...runtimeRows];
+
+  // Phase 1: group the OTel spans by session and collect their trace ids. Keep
+  // every span doc — the Evaluate API needs full trace context, so we do NOT
+  // filter these (only the runtime log records added in phase 2 are filtered).
+  const sessionMap = new Map<string, DocumentType[]>();
+  const traceToSession = new Map<string, string>();
+  const traceIds = new Set<string>();
+  for (const row of allSpanRows) {
+    const message = row.find((f) => f.field === "@message")?.value;
+    const sessionId = row.find((f) => f.field === "sessionId")?.value ?? "unknown";
+    const traceId = row.find((f) => f.field === "traceId")?.value;
+    if (!message) continue;
+    let doc: Record<string, unknown>;
+    try {
+      doc = JSON.parse(message) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!sessionMap.has(sessionId)) sessionMap.set(sessionId, []);
+    sessionMap.get(sessionId)!.push(doc as DocumentType);
+    if (traceId) {
+      traceIds.add(traceId);
+      traceToSession.set(traceId, sessionId);
+    }
+  }
+
+  if (sessionMap.size === 0) return [];
+
+  // Phase 2: the spans reference conversation turns whose text lives in the
+  // runtime's own log records (body.input / body.output). Without them the
+  // Evaluate API reports LogEventMissingException, so pull the log records for the
+  // discovered trace ids and attach them to their session.
+  if (traceIds.size > 0) {
+    const traceFilter = [...traceIds].map((t) => `'${sanitizeQueryValue(t)}'`).join(", ");
+    const logRows = await runCwQuery(
+      logs,
+      opts.runtimeLogGroup,
+      `fields @message, traceId\n` +
+        `     | filter traceId in [${traceFilter}]\n` +
+        `     | sort @timestamp asc\n     | limit 10000`,
+      startTimeSec,
+      endTimeSec,
+    );
+    for (const row of logRows) {
+      const message = row.find((f) => f.field === "@message")?.value;
+      const traceId = row.find((f) => f.field === "traceId")?.value;
+      if (!message) continue;
+      let doc: Record<string, unknown>;
+      try {
+        doc = JSON.parse(message) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      if (!isRelevantForEval(doc)) continue;
+      const sessionId = traceId ? (traceToSession.get(traceId) ?? "unknown") : "unknown";
+      if (!sessionMap.has(sessionId)) sessionMap.set(sessionId, []);
+      sessionMap.get(sessionId)!.push(doc as DocumentType);
+    }
+  }
+
+  return [...sessionMap]
+    .filter(([, spans]) => spans.length > 0)
+    .map(([sessionId, spans]) => ({ sessionId, spans }));
+}
+
+// isRelevantForEval keeps spans the Evaluate API can score: a supported
+// instrumentation scope, or a runtime log record carrying conversation turn text.
+function isRelevantForEval(doc: Record<string, unknown>): boolean {
+  const scopeName = (doc.scope as Record<string, unknown> | undefined)?.name as string | undefined;
+  if (scopeName && SUPPORTED_SCOPES.has(scopeName)) return true;
+  const body = doc.body;
+  return !!body && typeof body === "object" && ("input" in body || "output" in body);
 }
 
 // runtimeServiceName derives the CloudWatch trace service name that scopes a
